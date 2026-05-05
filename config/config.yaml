@@ -24,7 +24,7 @@ metadata_subdir: metadata
 fees: 0.00075         # 0.075 % per side (Binance taker)
 slippage: 0.0003      # 0.03 % per side
 leverage: 1.0
-risk_per_trade: 0.01  # 1 % of equity per trade
+risk_per_trade: 0.01  # 5 % of equity per trade
 
 # ── Strategy families to run ───────────────────────────────────────────────────
 # Comment out any family you want to skip

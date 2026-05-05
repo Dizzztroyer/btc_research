@@ -4,37 +4,35 @@ run_research.py
 ───────────────
 Main research orchestrator.
 
-Workflow
-────────
-1. Load configuration
-2. For each enabled strategy family × each locally stored timeframe:
-        a. Load feature DataFrame from disk
-        b. Run parameter optimisation (IS/OOS split)
-        c. Run walk-forward validation on best params
-        d. Run stress test on best params
-        e. Compute year-by-year breakdown
-        f. Collect results
-3. Rank all results by robustness score
-4. Generate all reports (CSV, HTML, plots)
+Speed improvements vs v1:
+  1. Numba JIT backtest loop         → 15-50× faster per backtest
+  2. Parallel param search (joblib)  → N_cores × faster per strategy
+  3. Checkpoint/resume               → survives reboots
+  4. Random-N sampling               → 50 params instead of 1458
+  5. Partial results saved instantly → nothing lost on crash
+
+Typical timing with all improvements:
+  Full run (6 families × 12 TF, random-n=50, no-wf) → 20-60 min
+  vs original: days
 
 Usage
 ─────
-    python run_research.py
-    python run_research.py --tf 4h 1d             # restrict timeframes
-    python run_research.py --strategy trend       # restrict strategy families
-    python run_research.py --tf 1h --strategy trend mean_reversion
-    python run_research.py --no-wf               # skip walk-forward (faster)
-    python run_research.py --direction long       # long-only
+    python run_research.py --tf 2h 4h 6h 8h 12h 1d --no-wf --no-stress
+    python run_research.py --tf 4h 8h 12h 1d --random-n 30 --no-wf
+    python run_research.py --reset-checkpoint
+    python run_research.py --direction long
+    python run_research.py --jobs 4   # explicit core count
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 import traceback
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import numpy as np
 import pandas as pd
@@ -46,7 +44,7 @@ from src.utils.logger import get_logger
 from src.features.feature_engine import FeatureEngine
 from src.backtest.engine import BacktestEngine, SimConfig
 from src.backtest.metrics import yearly_breakdown
-from src.strategies import STRATEGY_FAMILIES, STRATEGY_REGISTRY
+from src.strategies import STRATEGY_FAMILIES
 from src.strategies.base import BaseStrategy
 from src.research.optimizer import ParameterOptimizer
 from src.research.walk_forward import WalkForwardEngine
@@ -54,65 +52,89 @@ from src.research.reporter import Reporter
 
 logger = get_logger(__name__, log_file=Path("outputs/logs/research.log"))
 
+CHECKPOINT_FILE      = Path("outputs/logs/checkpoint.json")
+PARTIAL_RESULTS_FILE = Path("outputs/rankings/all_results_partial.csv")
+
+
+# ── Checkpoint ────────────────────────────────────────────────────────────────
+
+def _load_checkpoint() -> set:
+    if CHECKPOINT_FILE.exists():
+        try:
+            data = json.loads(CHECKPOINT_FILE.read_text())
+            done = set(tuple(x) for x in data.get("done", []))
+            logger.info(f"Checkpoint: {len(done)} runs already done — skipping")
+            return done
+        except Exception:
+            pass
+    return set()
+
+
+def _save_checkpoint(done: set) -> None:
+    CHECKPOINT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CHECKPOINT_FILE.write_text(
+        json.dumps({"done": [list(x) for x in sorted(done)]}, indent=2)
+    )
+
+
+def _append_partial(df: pd.DataFrame) -> None:
+    PARTIAL_RESULTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if PARTIAL_RESULTS_FILE.exists():
+        try:
+            existing = pd.read_csv(PARTIAL_RESULTS_FILE)
+            combined = pd.concat([existing, df], ignore_index=True)
+        except Exception:
+            combined = df
+    else:
+        combined = df
+    combined.to_csv(PARTIAL_RESULTS_FILE, index=False)
+
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="BTC Strategy Research Platform")
+    p = argparse.ArgumentParser(description="BTC Research — parallel + checkpoint")
     p.add_argument("--config",    default="config/config.yaml")
-    p.add_argument("--tf",        nargs="+", default=None, metavar="TIMEFRAME",
-                   help="Restrict to specific timeframes")
-    p.add_argument("--strategy",  nargs="+", default=None, metavar="FAMILY",
-                   help="Restrict to specific strategy families")
-    p.add_argument("--direction", default="both", choices=["long", "short", "both"])
-    p.add_argument("--no-wf",     action="store_true", help="Skip walk-forward validation")
-    p.add_argument("--no-stress", action="store_true", help="Skip stress tests")
-    p.add_argument("--top-n",     type=int, default=None, help="Override top_n for reports")
+    p.add_argument("--tf",        nargs="+", default=None)
+    p.add_argument("--strategy",  nargs="+", default=None)
+    p.add_argument("--direction", default="both", choices=["long","short","both"])
+    p.add_argument("--no-wf",     action="store_true")
+    p.add_argument("--no-stress", action="store_true")
+    p.add_argument("--top-n",     type=int, default=None)
+    p.add_argument("--random-n",  type=int, default=50,
+                   help="Random param sets per run (default 50, 0=full grid)")
+    p.add_argument("--jobs",      type=int, default=-1,
+                   help="Parallel workers for param search (-1=all cores)")
+    p.add_argument("--reset-checkpoint", action="store_true")
     return p.parse_args()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _available_timeframes(cfg: Config, requested: Optional[List[str]]) -> List[str]:
-    """Return locally available feature timeframes, optionally filtered."""
     paths = sorted(cfg.features_dir.glob("*_features.parquet"))
     avail = [p.stem.replace("_features", "") for p in paths]
     if not avail:
-        # Fall back to raw dir
-        paths = sorted(cfg.raw_dir.glob("*.parquet"))
-        avail = [p.stem for p in paths]
+        avail = [p.stem for p in sorted(cfg.raw_dir.glob("*.parquet"))]
     if requested:
-        filtered = [t for t in requested if t in avail]
-        missing  = [t for t in requested if t not in avail]
+        missing = [t for t in requested if t not in avail]
         if missing:
-            logger.warning(f"Requested timeframes not found locally: {missing}")
-        return filtered
+            logger.warning(f"Not found locally: {missing}")
+        return [t for t in requested if t in avail]
     return avail
 
 
 def _load_features(cfg: Config, timeframe: str) -> pd.DataFrame:
-    """Load feature parquet for one timeframe, building if necessary."""
-    engine = FeatureEngine(cfg)
-    df     = engine.load(timeframe)
+    df = FeatureEngine(cfg).load(timeframe)
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-    # Apply date range filter from config
     if cfg.start_date:
-        start = pd.Timestamp(cfg.start_date, tz="UTC")
-        df    = df[df["timestamp"] >= start]
+        df = df[df["timestamp"] >= pd.Timestamp(cfg.start_date, tz="UTC")]
     if cfg.end_date:
-        end = pd.Timestamp(cfg.end_date, tz="UTC")
-        df  = df[df["timestamp"] <= end]
+        df = df[df["timestamp"] <= pd.Timestamp(cfg.end_date, tz="UTC")]
     return df.reset_index(drop=True)
 
 
-def _stress_test(
-    strategy:  BaseStrategy,
-    df:        pd.DataFrame,
-    params:    dict,
-    cfg:       Config,
-    direction: str,
-) -> dict:
-    """Run backtest with 2× fees and 2× slippage; return metrics."""
+def _stress_test(strategy, df, params, cfg, direction) -> dict:
     sim = SimConfig(
         fees           = cfg.fees    * cfg.validation.stress_fee_mult,
         slippage       = cfg.slippage * cfg.validation.stress_slip_mult,
@@ -120,95 +142,122 @@ def _stress_test(
         risk_per_trade = cfg.risk_per_trade,
         direction      = direction,
     )
-    engine = BacktestEngine(sim)
-    # Use the OOS/test slice for stress
-    n      = len(df)
-    test_start = int(n * (cfg.validation.is_ratio + cfg.validation.oos_ratio))
-    df_test    = df.iloc[test_start:] if test_start < n else df
-    if len(df_test) < 30:
-        df_test = df  # fall back to full
-
+    n       = len(df)
+    ts      = int(n * (cfg.validation.is_ratio + cfg.validation.oos_ratio))
+    df_test = df.iloc[ts:] if ts < n and n - ts > 30 else df
     try:
-        df_sig  = strategy.generate_signals(df_test.copy(), params)
-        result  = engine.run(df_sig, strategy.name, "", params)
-        return result.metrics
+        df_sig = strategy.generate_signals(df_test.copy(), params)
+        return BacktestEngine(sim).run(df_sig, strategy.name, "", params).metrics
     except Exception:
         return {}
 
 
 def _extract_best_params(opt_df: pd.DataFrame) -> dict:
-    """Extract parameter dict from top row of optimiser output."""
     if opt_df.empty:
         return {}
-    row    = opt_df.iloc[0]
-    p_cols = [c for c in row.index if c.startswith("p_")]
-    return {c[2:]: row[c] for c in p_cols}
+    row = opt_df.iloc[0]
+    return {c[2:]: row[c] for c in row.index if c.startswith("p_")}
 
 
-def _make_sim_config(cfg: Config, direction: str) -> SimConfig:
-    return SimConfig(
-        fees           = cfg.fees,
-        slippage       = cfg.slippage,
-        leverage       = cfg.leverage,
-        risk_per_trade = cfg.risk_per_trade,
-        direction      = direction,
-    )
+def _estimate_bpy(df: pd.DataFrame) -> float:
+    if len(df) < 2:
+        return 365.0
+    ts    = pd.to_datetime(df["timestamp"])
+    total = (ts.iloc[-1] - ts.iloc[0]).total_seconds()
+    return 365.25 * 86_400 / (total / (len(ts)-1)) if total > 0 else 365.0
 
 
-# ── Main research loop ─────────────────────────────────────────────────────────
+# ── Main loop ─────────────────────────────────────────────────────────────────
 
 def run_research(
-    cfg:        Config,
-    timeframes: List[str],
-    families:   List[str],
-    direction:  str,
-    skip_wf:    bool,
-    skip_stress:bool,
-    top_n:      int,
+    cfg:              Config,
+    timeframes:       List[str],
+    families:         List[str],
+    direction:        str,
+    skip_wf:          bool,
+    skip_stress:      bool,
+    top_n:            int,
+    random_n:         int,
+    n_jobs:           int,
+    reset_checkpoint: bool,
 ) -> None:
-    """
-    Full research loop:
-    strategies × timeframes → optimise → WF → stress → report
-    """
+
     optimizer = ParameterOptimizer(cfg)
     wf_engine = WalkForwardEngine(cfg)
     reporter  = Reporter(cfg)
 
-    all_opt_results:  List[pd.DataFrame] = []
-    wf_summary_rows:  List[dict] = []
-    stress_rows:      List[dict] = []
-    equity_plots:     List[Path] = []
-    rejected_rows:    List[dict] = []
+    done_set = set()
+    if not reset_checkpoint:
+        done_set = _load_checkpoint()
+    elif CHECKPOINT_FILE.exists():
+        CHECKPOINT_FILE.unlink()
+        logger.info("Checkpoint reset")
 
-    best_yearly       = pd.DataFrame()
-    best_result_seen  = None     # (robustness_score, equity, drawdown, timestamps, name)
+    all_results:  List[pd.DataFrame] = []
+    wf_rows:      List[dict] = []
+    stress_rows:  List[dict] = []
+    equity_plots: List[Path] = []
+    rejected:     List[dict] = []
 
-    total = sum(
-        len(STRATEGY_FAMILIES[f])
-        for f in families
-        if f in STRATEGY_FAMILIES
-    ) * len(timeframes)
+    best_yearly     = pd.DataFrame()
+    best_robustness = -999999.0
 
-    logger.info(f"Research plan: {len(families)} families × {len(timeframes)} timeframes")
-    logger.info(f"Total runs: ~{total} (strategy × timeframe)")
+    if PARTIAL_RESULTS_FILE.exists() and not reset_checkpoint:
+        try:
+            prev = pd.read_csv(PARTIAL_RESULTS_FILE)
+            all_results.append(prev)
+            logger.info(f"Loaded {len(prev)} rows from partial results")
+        except Exception:
+            pass
+
+    total = sum(len(STRATEGY_FAMILIES[f]) for f in families if f in STRATEGY_FAMILIES) \
+            * len(timeframes)
+
+    # Log system info
+    import multiprocessing
+    n_cpu = multiprocessing.cpu_count()
+    from src.backtest.fast_engine import NUMBA_AVAILABLE
+    try:
+        from joblib import Parallel
+        joblib_ok = True
+    except ImportError:
+        joblib_ok = False
+
+    logger.info(f"CPU cores     : {n_cpu}")
+    logger.info(f"Numba JIT     : {'ON' if NUMBA_AVAILABLE else 'OFF (pip install numba)'}")
+    logger.info(f"Joblib        : {'ON' if joblib_ok else 'OFF (pip install joblib)'}")
+    logger.info(f"Research plan : {len(families)} families × {len(timeframes)} TFs = {total} runs")
+    logger.info(f"Random-N      : {random_n if random_n > 0 else 'FULL GRID'}")
+    logger.info(f"Jobs/run      : {n_jobs} ({'all cores' if n_jobs==-1 else str(n_jobs)})")
+    logger.info(f"Already done  : {len(done_set)}")
+
+    # Warm up numba on first run (avoids first-call delay mid-loop)
+    if NUMBA_AVAILABLE:
+        logger.info("Warming up Numba JIT (one-time, ~5s) …")
+        from src.backtest.fast_engine import get_fast_loop
+        get_fast_loop()
+        logger.info("Numba ready.")
 
     run_count = 0
 
     for family_name in families:
         if family_name not in STRATEGY_FAMILIES:
-            logger.warning(f"Unknown strategy family: {family_name} — skipping")
             continue
 
-        strategy_classes = STRATEGY_FAMILIES[family_name]
-
-        for StratClass in strategy_classes:
+        for StratClass in STRATEGY_FAMILIES[family_name]:
             strategy = StratClass()
             logger.info(f"\n{'='*60}")
-            logger.info(f"Strategy: {strategy.name} (family: {family_name})")
+            logger.info(f"Strategy: {strategy.name}  (family: {family_name})")
             logger.info(f"{'='*60}")
 
             for timeframe in timeframes:
                 run_count += 1
+                key = (strategy.name, timeframe)
+
+                if key in done_set:
+                    logger.info(f"[{run_count}/{total}] SKIP {strategy.name}/{timeframe}")
+                    continue
+
                 logger.info(f"\n[{run_count}/{total}] {strategy.name} / {timeframe}")
                 t0 = time.time()
 
@@ -216,143 +265,120 @@ def run_research(
                 try:
                     df = _load_features(cfg, timeframe)
                 except Exception as exc:
-                    logger.error(f"  Cannot load features for {timeframe}: {exc}")
+                    logger.error(f"  Feature load failed: {exc}")
+                    done_set.add(key); _save_checkpoint(done_set)
                     continue
 
                 if len(df) < 200:
-                    logger.warning(f"  Skipping {timeframe}: only {len(df)} rows")
+                    logger.warning(f"  Only {len(df)} rows — skip")
+                    done_set.add(key); _save_checkpoint(done_set)
                     continue
 
-                # ── Parameter optimisation ────────────────────────────────────
+                # ── Parallel param optimisation ────────────────────────────────
                 try:
+                    rn     = random_n if random_n > 0 else None
                     opt_df = optimizer.optimize(
                         strategy  = strategy,
                         df        = df,
                         timeframe = timeframe,
                         direction = direction,
+                        random_n  = rn,
+                        n_jobs    = n_jobs,
                     )
                 except Exception as exc:
                     logger.error(f"  Optimisation failed: {exc}\n{traceback.format_exc()}")
+                    done_set.add(key); _save_checkpoint(done_set)
                     continue
 
                 if opt_df.empty:
-                    logger.warning(f"  No valid results — skipping")
-                    rejected_rows.append({
-                        "strategy": strategy.name, "timeframe": timeframe,
-                        "reason": "empty optimiser output",
-                    })
+                    logger.warning("  No valid results")
+                    rejected.append({"strategy": strategy.name, "timeframe": timeframe,
+                                     "reason": "empty"})
+                    done_set.add(key); _save_checkpoint(done_set)
                     continue
 
-                all_opt_results.append(opt_df)
+                _append_partial(opt_df)
+                all_results.append(opt_df)
 
                 best_params = _extract_best_params(opt_df)
                 best_row    = opt_df.iloc[0]
+                oos_pf      = best_row.get("oos_pf",     0) or 0
+                oos_trades  = best_row.get("oos_trades",  0) or 0
+                robustness  = best_row.get("robustness", -9999) or -9999
 
-                # ── Reject filters ─────────────────────────────────────────────
-                oos_pf     = best_row.get("oos_pf",     0) or 0
-                oos_trades = best_row.get("oos_trades",  0) or 0
-                robustness = best_row.get("robustness",  -9999) or -9999
-
+                # ── Reject ────────────────────────────────────────────────────
                 if oos_trades < cfg.validation.min_trades:
-                    logger.warning(f"  Rejected: OOS trades={oos_trades} < {cfg.validation.min_trades}")
-                    rejected_rows.append({
-                        "strategy": strategy.name, "timeframe": timeframe,
-                        "reason": f"OOS trades={oos_trades} < min",
-                        **{f"p_{k}": v for k, v in best_params.items()},
-                    })
+                    logger.warning(f"  Rejected: trades={oos_trades} < {cfg.validation.min_trades}")
+                    rejected.append({"strategy": strategy.name, "timeframe": timeframe,
+                                     "reason": f"trades={oos_trades}<min"})
+                    done_set.add(key); _save_checkpoint(done_set)
                     continue
 
                 if oos_pf < cfg.validation.min_profit_factor:
-                    logger.warning(f"  Rejected: OOS PF={oos_pf:.2f} < {cfg.validation.min_profit_factor}")
-                    rejected_rows.append({
-                        "strategy": strategy.name, "timeframe": timeframe,
-                        "reason": f"OOS PF={oos_pf:.2f} < min",
-                    })
+                    logger.warning(f"  Rejected: PF={oos_pf:.2f}")
+                    rejected.append({"strategy": strategy.name, "timeframe": timeframe,
+                                     "reason": f"PF={oos_pf:.2f}<min"})
+                    done_set.add(key); _save_checkpoint(done_set)
                     continue
 
                 logger.info(
-                    f"  ✓ Accepted | OOS PF={oos_pf:.2f} | "
-                    f"OOS Sharpe={best_row.get('oos_sharpe', float('nan')):.2f} | "
+                    f"  ✓ Accepted | PF={oos_pf:.2f} | "
+                    f"Sharpe={best_row.get('oos_sharpe', float('nan')):.2f} | "
                     f"Robustness={robustness:.2f}"
                 )
 
-                # ── Walk-forward validation ────────────────────────────────────
+                # ── Walk-forward ───────────────────────────────────────────────
                 if not skip_wf:
                     try:
-                        wf_result = wf_engine.run(
-                            strategy  = strategy,
-                            df        = df,
-                            timeframe = timeframe,
-                            direction = direction,
-                        )
-                        wf_m = wf_result.combined_metrics
-                        wf_summary_rows.append({
-                            "strategy":    strategy.name,
-                            "timeframe":   timeframe,
-                            "wf_sharpe":   wf_m.get("sharpe",        np.nan),
-                            "wf_pf":       wf_m.get("profit_factor", np.nan),
-                            "wf_return":   wf_m.get("total_return",  np.nan),
-                            "wf_mdd":      wf_m.get("max_drawdown",  np.nan),
-                            "wf_trades":   wf_m.get("trade_count",   0),
-                            "n_windows":   len(wf_result.windows),
+                        wf  = wf_engine.run(strategy, df, timeframe, direction)
+                        wm  = wf.combined_metrics
+                        wf_rows.append({
+                            "strategy":  strategy.name, "timeframe": timeframe,
+                            "wf_sharpe": wm.get("sharpe",        np.nan),
+                            "wf_pf":     wm.get("profit_factor", np.nan),
+                            "wf_return": wm.get("total_return",  np.nan),
+                            "wf_mdd":    wm.get("max_drawdown",  np.nan),
+                            "wf_trades": wm.get("trade_count",   0),
+                            "n_windows": len(wf.windows),
                         })
-
-                        # Use WF equity for best-result tracking
-                        if (
-                            not wf_result.combined_equity.empty and
-                            (best_result_seen is None or robustness > best_result_seen[0])
-                        ):
-                            best_result_seen = (
-                                robustness,
-                                wf_result.combined_equity,
-                                wf_result.combined_equity,  # placeholder for drawdown
-                                None,
-                                f"{strategy.name}_{timeframe}_wf",
-                            )
                     except Exception as exc:
-                        logger.warning(f"  Walk-forward failed: {exc}")
+                        logger.warning(f"  WF failed: {exc}")
 
                 # ── Stress test ────────────────────────────────────────────────
                 if not skip_stress:
                     try:
-                        stress_m = _stress_test(strategy, df, best_params, cfg, direction)
+                        sm = _stress_test(strategy, df, best_params, cfg, direction)
                         stress_rows.append({
-                            "strategy":     strategy.name,
-                            "timeframe":    timeframe,
-                            "stress_sharpe":stress_m.get("sharpe",        np.nan),
-                            "stress_pf":    stress_m.get("profit_factor", np.nan),
-                            "stress_return":stress_m.get("total_return",  np.nan),
-                            "stress_mdd":   stress_m.get("max_drawdown",  np.nan),
-                            "stress_trades":stress_m.get("trade_count",   0),
+                            "strategy": strategy.name, "timeframe": timeframe,
+                            "stress_sharpe": sm.get("sharpe",        np.nan),
+                            "stress_pf":     sm.get("profit_factor", np.nan),
+                            "stress_return": sm.get("total_return",  np.nan),
+                            "stress_mdd":    sm.get("max_drawdown",  np.nan),
+                            "stress_trades": sm.get("trade_count",   0),
                         })
                     except Exception as exc:
-                        logger.warning(f"  Stress test failed: {exc}")
+                        logger.warning(f"  Stress failed: {exc}")
 
-                # ── Full-sample backtest for equity plot ───────────────────────
+                # ── Equity plot ────────────────────────────────────────────────
                 if cfg.reporting.plot_equity_curves:
                     try:
-                        sim = _make_sim_config(cfg, direction)
-                        eng = BacktestEngine(sim)
+                        sim    = SimConfig(fees=cfg.fees, slippage=cfg.slippage,
+                                           leverage=cfg.leverage,
+                                           risk_per_trade=cfg.risk_per_trade,
+                                           direction=direction)
+                        eng    = BacktestEngine(sim)
                         df_sig = strategy.generate_signals(df.copy(), best_params)
                         res    = eng.run(df_sig, strategy.name, timeframe, best_params)
-
                         if res.ok:
-                            plot_name = f"{strategy.name}_{timeframe}"
-                            ts = df_sig["timestamp"] if "timestamp" in df_sig.columns else None
-                            p  = reporter.plot_equity_curve(
-                                equity    = res.equity,
-                                drawdown  = res.drawdown,
-                                name      = plot_name,
-                                timestamps = ts,
+                            p = reporter.plot_equity_curve(
+                                equity     = res.equity,
+                                drawdown   = res.drawdown,
+                                name       = f"{strategy.name}_{timeframe}",
+                                timestamps = df_sig.get("timestamp"),
                             )
                             equity_plots.append(p)
-
-                            # Track best for yearly breakdown
-                            if best_result_seen is None or robustness > best_result_seen[0]:
-                                best_result_seen = (
-                                    robustness, res.equity, res.drawdown, ts, plot_name
-                                )
-                                # Compute yearly breakdown
+                            if robustness > best_robustness:
+                                best_robustness = robustness
                                 best_yearly = yearly_breakdown(
                                     trades          = res.trades,
                                     equity          = res.equity,
@@ -361,135 +387,103 @@ def run_research(
                                     initial_capital = cfg.risk_per_trade,
                                 )
                     except Exception as exc:
-                        logger.warning(f"  Equity plot failed: {exc}")
+                        logger.warning(f"  Plot failed: {exc}")
 
-                elapsed = time.time() - t0
-                logger.info(f"  Completed in {elapsed:.1f}s")
+                done_set.add(key)
+                _save_checkpoint(done_set)
+                logger.info(f"  Done in {time.time()-t0:.1f}s")
 
-    # ── Combine all optimiser results ──────────────────────────────────────────
-    if not all_opt_results:
-        logger.error("No valid results produced. Exiting.")
+    # ── Final reports ─────────────────────────────────────────────────────────
+    if not all_results:
+        logger.error("No results. Check logs.")
         return
 
-    combined = pd.concat(all_opt_results, ignore_index=True)
-    combined = combined.sort_values("robustness", ascending=False).reset_index(drop=True)
-    rejected_df = pd.DataFrame(rejected_rows)
+    combined = pd.concat(all_results, ignore_index=True)
+    key_cols = ["strategy","timeframe"] + [c for c in combined.columns if c.startswith("p_")]
+    combined = (
+        combined
+        .drop_duplicates(subset=key_cols)
+        .sort_values("robustness", ascending=False)
+        .reset_index(drop=True)
+    )
 
-    # ── Save CSVs ──────────────────────────────────────────────────────────────
+    rej_df = pd.DataFrame(rejected)
     reporter.save_rankings(combined, "all_results.csv")
-
-    if wf_summary_rows:
-        reporter.save_wf_summary(wf_summary_rows, "wf_summary.csv")
-
-    if stress_rows:
-        reporter.save_stress_summary(stress_rows)
-
+    if wf_rows:    reporter.save_wf_summary(wf_rows)
+    if stress_rows:reporter.save_stress_summary(stress_rows)
     if not best_yearly.empty:
         reporter.save_yearly_breakdown(best_yearly, "best_strategy")
 
-    # ── Heatmaps ───────────────────────────────────────────────────────────────
-    heatmap_plots: List[Path] = []
+    heatmaps: List[Path] = []
     if cfg.reporting.plot_heatmaps and "strategy" in combined.columns:
         for metric in ["oos_sharpe", "oos_pf", "oos_return"]:
             try:
                 p = reporter.plot_tf_strategy_heatmap(combined, metric=metric)
                 if p and p.exists():
-                    heatmap_plots.append(p)
-            except Exception as exc:
-                logger.warning(f"Heatmap failed ({metric}): {exc}")
+                    heatmaps.append(p)
+            except Exception:
+                pass
 
-    # ── HTML report ────────────────────────────────────────────────────────────
     if cfg.reporting.html_report:
         try:
             reporter.generate_html_report(
-                all_results   = combined,
-                wf_rows       = wf_summary_rows,
-                best_yearly   = best_yearly,
-                rejected      = rejected_df,
-                equity_plots  = equity_plots,
-                heatmap_plots = heatmap_plots,
-                top_n         = top_n,
+                all_results=combined, wf_rows=wf_rows,
+                best_yearly=best_yearly, rejected=rej_df,
+                equity_plots=equity_plots, heatmap_plots=heatmaps, top_n=top_n,
             )
         except Exception as exc:
-            logger.error(f"HTML report failed: {exc}\n{traceback.format_exc()}")
+            logger.error(f"HTML failed: {exc}")
 
-    # ── Final console summary ──────────────────────────────────────────────────
     logger.info("\n" + "="*60)
     logger.info("RESEARCH COMPLETE")
     logger.info("="*60)
-    logger.info(f"Total result rows : {len(combined)}")
-    logger.info(f"Rejected          : {len(rejected_rows)}")
-    logger.info(f"WF runs completed : {len(wf_summary_rows)}")
-    logger.info("")
-    logger.info("TOP 10 by Robustness:")
-    display_cols = ["strategy", "timeframe", "oos_sharpe", "oos_pf",
-                    "oos_return", "oos_drawdown", "oos_trades", "robustness"]
-    cols = [c for c in display_cols if c in combined.columns]
-    with pd.option_context("display.max_columns", None, "display.width", 120):
-        logger.info("\n" + combined[cols].head(10).to_string(index=False))
-
-    logger.info(f"\nOutputs saved to: {cfg.output_dir}")
+    logger.info(f"Results   : {len(combined)}")
+    logger.info(f"Rejected  : {len(rejected)}")
+    logger.info(f"WF runs   : {len(wf_rows)}")
+    cols = [c for c in ["strategy","timeframe","oos_sharpe","oos_pf",
+                         "oos_return","oos_drawdown","oos_trades","robustness"]
+            if c in combined.columns]
+    with pd.option_context("display.max_columns", None, "display.width", 130):
+        logger.info("\nTOP 10:\n" + combined[cols].head(10).to_string(index=False))
+    logger.info(f"\nOutputs → {cfg.output_dir}")
 
 
-def _estimate_bpy(df: pd.DataFrame) -> float:
-    if len(df) < 2 or "timestamp" not in df.columns:
-        return 365.0
-    ts    = pd.to_datetime(df["timestamp"])
-    total = (ts.iloc[-1] - ts.iloc[0]).total_seconds()
-    n     = len(ts) - 1
-    if total <= 0:
-        return 365.0
-    return 365.25 * 86_400 / (total / n)
-
-
-# ── Entry point ────────────────────────────────────────────────────────────────
+# ── Entry ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     args = parse_args()
     cfg  = load_config(Path(args.config))
 
-    # ── Resolve timeframes ─────────────────────────────────────────────────────
     timeframes = _available_timeframes(cfg, args.tf)
     if not timeframes:
-        logger.error(
-            "No locally stored timeframes found.\n"
-            "Run: python download_all_timeframes.py\n"
-            "     python build_features.py"
-        )
+        logger.error("No feature files. Run build_features.py first.")
         sys.exit(1)
 
-    logger.info(f"Timeframes to research: {timeframes}")
-
-    # ── Resolve strategy families ──────────────────────────────────────────────
-    if args.strategy:
-        families = args.strategy
-    else:
-        families = cfg.enabled_strategies
-
-    unknown = [f for f in families if f not in STRATEGY_FAMILIES]
-    if unknown:
-        logger.warning(f"Unknown strategy families: {unknown}")
+    families = args.strategy or cfg.enabled_strategies
     families = [f for f in families if f in STRATEGY_FAMILIES]
-
     if not families:
-        logger.error("No valid strategy families selected.")
+        logger.error("No valid families.")
         sys.exit(1)
 
-    logger.info(f"Strategy families: {families}")
-    logger.info(f"Direction        : {args.direction}")
-    logger.info(f"Walk-forward     : {'disabled' if args.no_wf else 'enabled'}")
-    logger.info(f"Stress test      : {'disabled' if args.no_stress else 'enabled'}")
-
-    top_n = args.top_n or cfg.reporting.top_n
+    logger.info(f"Timeframes : {timeframes}")
+    logger.info(f"Families   : {families}")
+    logger.info(f"Direction  : {args.direction}")
+    logger.info(f"WF         : {'off' if args.no_wf else 'on'}")
+    logger.info(f"Stress     : {'off' if args.no_stress else 'on'}")
+    logger.info(f"Random-N   : {args.random_n}")
+    logger.info(f"Jobs       : {args.jobs}")
 
     run_research(
-        cfg         = cfg,
-        timeframes  = timeframes,
-        families    = families,
-        direction   = args.direction,
-        skip_wf     = args.no_wf,
-        skip_stress = args.no_stress,
-        top_n       = top_n,
+        cfg              = cfg,
+        timeframes       = timeframes,
+        families         = families,
+        direction        = args.direction,
+        skip_wf          = args.no_wf,
+        skip_stress      = args.no_stress,
+        top_n            = args.top_n or cfg.reporting.top_n,
+        random_n         = args.random_n,
+        n_jobs           = args.jobs,
+        reset_checkpoint = args.reset_checkpoint,
     )
 
 

@@ -12,3 +12,11 @@ jinja2>=3.1.2
 tqdm>=4.66.0
 requests>=2.31.0
 kaleido>=0.2.1
+
+# Kronos screener
+torch>=2.2.0
+transformers>=4.40.0
+accelerate>=0.29.0
+huggingface_hub>=0.22.0
+schedule>=1.2.0
+python-dotenv>=1.0.0

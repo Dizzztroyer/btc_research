@@ -1,0 +1,94 @@
+btc_research/
+│
+├── PROJECT_CONTEXT.md          # Research state, baseline metrics, rules — READ FIRST
+├── PROJECT_STRUCTURE.md        # File descriptions and architecture
+├── project_tree.txt            # This file
+├── README.md                   # Project overview
+├── requirements.txt            # Python dependencies
+│
+├── config/
+│   └── config.yaml             # Main config: fees, slippage, risk, paths, IS/OOS ratios
+│
+├── data/
+│   ├── raw/BTCUSDT/            # Raw OHLCV parquet files per timeframe
+│   │   ├── 1h.parquet, 4h.parquet, 6h.parquet, 8h.parquet ...
+│   │   ├── 3h.parquet          # Aggregated from 1h via aggregate_3h.py
+│   │   └── (1m 3m 5m 15m 30m 2h 3h 4h 6h 8h 12h 1d 3d 1w 1M)
+│   ├── features/BTCUSDT/       # Pre-computed feature parquet (140 cols per TF)
+│   │   └── {tf}_features.parquet
+│   └── metadata/               # Download state, checksums
+│
+├── outputs/
+│   ├── rankings/               # Research result CSVs
+│   │   ├── all_results.csv                  # All 20K+ tested combinations
+│   │   ├── wf_summary.csv                   # Walk-forward per strategy/TF
+│   │   ├── enhanced_backtest_summary.csv    # BASE vs ML_SIZE comparison
+│   │   ├── ml_sizer_diagnostics.csv         # ML training diagnostics (AUC, std, etc.)
+│   │   ├── atr_regime_results.csv           # ATR regime study results
+│   │   ├── atr_regime_breakdown.csv         # PF/WR per ATR regime
+│   │   ├── session_study_results.csv        # Session study results
+│   │   ├── session_breakdown.csv            # PF/WR per session
+│   │   ├── volume_study_results.csv         # Volume confirmation study
+│   │   ├── ml_enhanced_results.csv          # Extended ML feature study
+│   │   ├── ml_enhanced_diagnostics.csv      # Extended ML diagnostics
+│   │   ├── wf_validation_detail.csv         # WF validation per window
+│   │   └── wf_validation_summary.csv        # WF validation aggregate
+│   ├── plots/                  # PNG equity curves, regime charts, importance plots
+│   ├── reports/                # HTML research reports
+│   └── logs/                   # Run logs + checkpoint.json
+│
+├── src/
+│   ├── backtest/
+│   │   ├── engine.py           # BacktestEngine, SimConfig, BacktestResult
+│   │   ├── fast_engine.py      # Numba JIT compiled simulation loop
+│   │   └── metrics.py          # PF, Sharpe, MDD, Sortino, Calmar, yearly_breakdown
+│   │
+│   ├── data/
+│   │   ├── downloader.py       # OHLCV download via ccxt (Binance)
+│   │   └── validator.py        # Gap detection, data quality checks
+│   │
+│   ├── features/
+│   │   └── feature_engine.py   # Computes 140 features: EMA, ATR, RSI, ADX,
+│   │                           # Donchian, Bollinger, vol_zscore, session,
+│   │                           # squeeze, regime labels, calendar features
+│   │
+│   ├── ml/
+│   │   ├── ml_sizer_v2.py      # XGBoost position sizer with rank normalization
+│   │   │                       # Core: score_to_mult, compute_weights, MLSizerV2
+│   │   ├── dynamic_engine.py   # Backtest engine with per-bar size multipliers
+│   │   │                       # Integrates ml_mults × atr_mults × vol_mults
+│   │   └── ml_filter.py        # Legacy binary filter (not used in production)
+│   │
+│   ├── research/
+│   │   ├── optimizer.py        # Parallel param grid search with OOS filter
+│   │   ├── reporter.py         # CSV/HTML report generation
+│   │   └── walk_forward.py     # Expanding-window WF evaluation
+│   │
+│   ├── strategies/
+│   │   ├── base.py             # BaseStrategy abstract class
+│   │   ├── structure.py        # swing_breakout ← PRIMARY STRATEGY
+│   │   │                       # also: liquidity_sweep, bos
+│   │   ├── trend.py            # donchian_breakout, ema_cross, pullback_trend
+│   │   ├── breakout.py         # squeeze_breakout, consolidation_breakout, atr_expansion
+│   │   ├── mean_reversion.py   # RSI, Bollinger, EMA deviation (all rejected on BTC)
+│   │   ├── ensemble.py         # weighted_ensemble, majority_vote
+│   │   └── regime.py           # regime_switch (rejected — overfit)
+│   │
+│   └── utils/
+│       ├── config_loader.py    # load_config() → Config dataclass
+│       └── logger.py           # Structured logger with file + console output
+│
+├── run_research.py             # Main research loop: grid search + OOS + WF
+├── run_enhanced_backtest.py    # BASE vs ML_SIZE comparison (ML position sizer)
+├── run_atr_regime_study.py     # ATR regime analysis + ATR_SIZE + ML_ATR
+├── run_wf_validation.py        # Walk-forward validation: BASE vs ML_SIZE vs ML_ATR
+├── run_session_study.py        # Session filter + sizing study (concluded: no edge)
+├── run_volume_study.py         # Volume confirmation + ML_VOL (12h: confirmed edge)
+├── run_ml_enhanced.py          # ML with extended feature set + strict quality gates
+├── run_ml_filter.py            # Legacy binary ML filter (concluded: harmful)
+├── run_inversion_study.py      # Inversion study for losing strategies (concluded: no edge)
+├── run_multiples_of_3.py       # Research on 3h/3d/6h/12h timeframes
+├── aggregate_3h.py             # Aggregates 1h → 3h candles
+├── build_features.py           # Build feature files for given timeframes
+├── download_all_timeframes.py  # Download raw OHLCV data
+└── update_all_timeframes.py    # Incremental data update
